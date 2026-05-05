@@ -1,0 +1,237 @@
+# Fine-tuning config for cohere-transcribe-03-2026 on Saudi Arabic
+# Architecture: FastConformer-XL encoder (48 layers, d_model=1280)
+#               + Transformer decoder (8 layers, hidden=1024)
+# All architecture values taken directly from CohereLabs/cohere-transcribe-03-2026 config.json
+
+name: "cohere-transcribe-saudi-finetune"
+
+# Path to the converted .nemo checkpoint (output of convert_cohere_to_nemo.py)
+init_from_nemo_model: ???   # e.g. /shared/models/cohere-transcribe/cohere_transcribe.nemo
+
+model:
+  sample_rate: 16000
+  label_smoothing: 0.0
+  log_prediction: true
+  use_loss_mask_for_prompt: false
+
+  prompt_format: "cohere_asr"
+
+  # Arabic fine-tuning — override default language slots to Arabic
+  prompt_defaults:
+    - role: user
+      slots:
+        source_lang: "<|ar|>"
+        target_lang: "<|ar|>"
+        pnc: "<|pnc|>"
+        itn: "<|noitn|>"
+        diarize: "<|nodiarize|>"
+        emotion: "<|emo:undefined|>"
+        timestamp: "<|notimestamp|>"
+        decodercontext: ""
+
+  model_defaults:
+    asr_enc_hidden: 1280   # from config.json model_defaults.asr_enc_hidden
+    lm_enc_hidden: 1024    # from config.json model_defaults.lm_enc_hidden
+    lm_dec_hidden: 1024    # from config.json model_defaults.lm_dec_hidden
+
+  train_ds:
+    use_lhotse: true
+    manifest_filepath: ???   # path to Lhotse cuts manifest on cluster e.g. /data/asr/train/cuts.jsonl.gz
+    sample_rate: ${model.sample_rate}
+    shuffle: true
+    num_workers: 8
+    batch_size: null
+    batch_duration: 360       # seconds of audio per batch
+    quadratic_duration: 15    # penalize long sequences
+    use_bucketing: true
+    num_buckets: 20
+    bucket_buffer_size: 20000
+    shuffle_buffer_size: 10000
+
+  validation_ds:
+    use_lhotse: true
+    manifest_filepath: ???   # path to validation Lhotse cuts manifest
+    sample_rate: ${model.sample_rate}
+    batch_size: 8
+    shuffle: false
+    num_workers: 4
+    pin_memory: true
+    use_bucketing: false
+
+  # Tokenizer — uses Cohere's custom tokenizer (vocab_size=16384)
+  tokenizer:
+    dir: ???    # path to tokenizer files downloaded from HuggingFace
+    type: agg
+
+  # Audio preprocessor — values from config.json preprocessor section
+  preprocessor:
+    _target_: nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor
+    sample_rate: ${model.sample_rate}
+    normalize: "per_feature"
+    window_size: 0.025
+    window_stride: 0.01
+    window: "hann"
+    features: 128            # from config.json preprocessor.features (note: 128, not 80)
+    n_fft: 512
+    log: true
+    frame_splicing: 1
+    dither: 0.00001
+    pad_to: 0
+    pad_value: 0.0
+
+  # SpecAugmentation — added for fine-tuning regularization
+  spec_augment:
+    _target_: nemo.collections.asr.modules.SpectrogramAugmentation
+    freq_masks: 2
+    time_masks: 10
+    freq_width: 27
+    time_width: 0.05
+
+  # FastConformer-XL Encoder — values from config.json encoder section
+  encoder:
+    _target_: nemo.collections.asr.modules.ConformerEncoder
+    feat_in: ${model.preprocessor.features}
+    feat_out: -1
+    n_layers: 48             # from config.json encoder.n_layers
+    d_model: ${model.model_defaults.asr_enc_hidden}   # 1280
+
+    # Subsampling
+    subsampling: dw_striding
+    subsampling_factor: 8
+    subsampling_conv_channels: 256
+    causal_downsampling: false
+    reduction: null
+    reduction_position: null
+    reduction_factor: 1
+
+    # Feed forward
+    ff_expansion_factor: 4
+
+    # Multi-head attention
+    self_attention_model: rel_pos
+    n_heads: 8
+    att_context_size: [-1, -1]
+    xscaling: false
+    untie_biases: true
+    pos_emb_max_len: 5000
+
+    # Convolution
+    conv_kernel_size: 9
+    conv_norm_type: batch_norm
+    conv_context_size: null
+
+    # Dropout — original model has 0; small values added for fine-tuning
+    dropout: 0.1
+    dropout_pre_encoder: 0.1
+    dropout_emb: 0.0
+    dropout_att: 0.1
+
+  # Transformer encoder between ASR encoder and decoder — disabled (num_layers=0)
+  transf_encoder:
+    _target_: nemo.collections.asr.modules.transformer.transformer_encoders.TransformerEncoder
+    num_layers: 0
+    hidden_size: ${model.model_defaults.lm_enc_hidden}
+    inner_size: 4096
+    num_attention_heads: 8
+    ffn_dropout: 0.0
+    attn_score_dropout: 0.0
+    attn_layer_dropout: 0.0
+    mask_future: false
+    pre_ln: true
+    pre_ln_final_layer_norm: true
+
+  # Transformer Decoder — values from config.json transf_decoder section
+  transf_decoder:
+    _target_: nemo.collections.asr.modules.transformer.get_nemo_transformer
+    model_name: null
+    pretrained: false
+    encoder: null
+    pre_ln_final_layer_norm: true   # from config.json
+
+    config_dict:
+      max_sequence_length: 1024    # from config.json transf_decoder.config_dict
+      num_token_types: 0
+      embedding_dropout: 0.0
+      learn_positional_encodings: false
+      hidden_size: ${model.model_defaults.lm_dec_hidden}   # 1024
+      inner_size: 4096             # from config.json transf_decoder.config_dict.inner_size
+      num_layers: 8                # from config.json transf_decoder.config_dict.num_layers
+      num_attention_heads: 8
+      ffn_dropout: 0.0
+      attn_score_dropout: 0.0
+      attn_layer_dropout: 0.0
+      hidden_act: relu
+      pre_ln: true
+      vocab_size: null             # set at runtime from tokenizer
+
+  # Token classifier head — values from config.json head section
+  head:
+    _target_: nemo.collections.asr.parts.submodules.token_classifier.TokenClassifier
+    num_layers: 1
+    activation: relu
+    log_softmax: true
+    hidden_size: ${model.model_defaults.lm_dec_hidden}
+    num_classes: null            # set at runtime (vocab_size=16384)
+    dropout: 0.0
+    use_transformer_init: true
+
+  # Decoding — values from config.json decoding section
+  decoding:
+    strategy: beam
+    return_best_hypothesis: true
+    beam:
+      beam_size: 1
+      len_pen: 0.0
+      max_generation_delta: 50
+
+  loss:
+    _target_: nemo.collections.common.losses.smoothed_cross_entropy.SmoothedCrossEntropyLoss
+    label_smoothing: ${model.label_smoothing}
+    pad_id: null
+
+  optim:
+    name: adamw
+    lr: 1e-4                 # fine-tuning LR — lower than pretraining
+    betas: [0.9, 0.98]
+    weight_decay: 1e-3
+    sched:
+      name: InverseSquareRootAnnealing
+      warmup_steps: 1000
+      warmup_ratio: null
+      min_lr: 1e-6
+
+trainer:
+  devices: 2               # 2x A100 on RunAI
+  num_nodes: 1
+  max_epochs: -1
+  max_steps: 50000
+  val_check_interval: 1.0
+  accelerator: auto
+  strategy:
+    _target_: lightning.pytorch.strategies.DDPStrategy
+    gradient_as_bucket_view: true
+  accumulate_grad_batches: 1
+  gradient_clip_val: 1.0
+  precision: bf16-mixed
+  log_every_n_steps: 100
+  enable_progress_bar: true
+  num_sanity_val_steps: 2
+  check_val_every_n_epoch: 1
+  sync_batchnorm: true
+  enable_checkpointing: false
+  logger: false
+  use_distributed_sampler: false
+
+exp_manager:
+  exp_dir: /workspace/NeMo/stc_asr/experiments
+  name: ${name}
+  create_tensorboard_logger: true
+  create_checkpoint_callback: true
+  checkpoint_callback_params:
+    monitor: "val_wer"
+    mode: "min"
+    save_top_k: 3
+    always_save_nemo: true
+  resume_if_exists: true
+  resume_ignore_no_checkpoint: false
+  create_wandb_logger: false
